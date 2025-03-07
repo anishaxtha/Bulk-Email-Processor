@@ -1,4 +1,4 @@
-import mongoose from "mongoose";
+const mongoose = require("mongoose");
 
 const EmailTemplateSchema = new mongoose.Schema(
   {

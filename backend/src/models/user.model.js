@@ -1,14 +1,13 @@
 const mongoose = require("mongoose");
-const bcryptjs = require("bcryptjs");
+const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 
 const UserSchema = new mongoose.Schema(
   {
     name: {
       type: String,
-      required: true,
+      required: [true, "Please provide a name"],
       trim: true,
-      maxlength: [50, "Name cannot be more then 20 characters"],
     },
     email: {
       type: String,
@@ -36,19 +35,25 @@ const UserSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-// Encrypt password before saving
+// Encrypt password using bcrypt
 UserSchema.pre("save", async function (next) {
   if (!this.isModified("password")) {
     next();
   }
-  const salt = await bcrypt.genSalt(10);
-  this.password = await bcrypt.hash(this.password, salt);
+
+  try {
+    const salt = await bcrypt.genSalt(10);
+    this.password = await bcrypt.hash(this.password, salt);
+    next();
+  } catch (error) {
+    next(error);
+  }
 });
 
-// Generate JWT Token
-UserSchema.methods.generateAuthToken = function () {
+// Sign JWT and return
+UserSchema.methods.getSignedJwtToken = function () {
   return jwt.sign({ id: this._id }, process.env.JWT_SECRET, {
-    expiresIn: process.env.JWT_EXPIRATION,
+    expiresIn: process.env.JWT_EXPIRE,
   });
 };
 
@@ -57,14 +62,18 @@ UserSchema.methods.matchPassword = async function (enteredPassword) {
   return await bcrypt.compare(enteredPassword, this.password);
 };
 
-// Generate email verification token
+// Generate verification token
 UserSchema.methods.generateVerificationToken = function () {
-  const verificationToken =
-    Math.random().toString(36).substring(2, 15) +
-    Math.random().toString(36).substring(2, 15);
+  // Generate a verification token
+  const verificationToken = jwt.sign(
+    { id: this._id },
+    process.env.JWT_SECRET,
+    { expiresIn: process.env.JWT_EXPIRE } // Set expiration to 7 days
+  );
 
   this.verificationToken = verificationToken;
-  this.verificationTokenExpire = Date.now() + 24 * 60 * 60 * 1000; 
+  this.verificationExpires = Date.now() + 7 * 24 * 60 * 60 * 1000; // 7 days
+
   return verificationToken;
 };
 

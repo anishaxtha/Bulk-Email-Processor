@@ -73,3 +73,27 @@
 #### Frontend
 
 - `REACT_APP_API_URL` - Backend API URL
+
+### Project Structure
+
+```
+project/
+├── backend/
+│   ├── config/
+│   ├── controllers/
+│   ├── middleware/
+│   ├── models/
+│   ├── routes/
+│   ├── services/
+│   ├── utils/
+│   ├── seeders/
+│   └── server.js
+├── frontend/
+│   ├── public/
+│   └── src/
+│       ├── components/
+│       ├── services/
+│       ├── App.jsx
+│       └── main.js
+└── README.md
+```

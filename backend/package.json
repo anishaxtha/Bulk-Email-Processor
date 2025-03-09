@@ -4,7 +4,7 @@
   "main": "index.js",
   "scripts": {
     "start": "nodemon index.js",
-    "seed": "node seeders/templateSeeder.js",
+    "seed": "node src/seeders/templateSeeder.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "author": "",

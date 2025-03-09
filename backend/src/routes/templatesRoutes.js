@@ -1,15 +1,19 @@
 const express = require("express");
 const {
   getTemplates,
-  getTemplate,
+  getTemplateById,
+  createDefaultTemplates,
 } = require("../controllers/templateController");
 const { protect } = require("../middleware/auth");
 
-const templateRoutes = express.Router();
+const router = express.Router();
 
-templateRoutes.use(protect);
+// Protect all routes
+router.use(protect);
 
-templateRoutes.route("/").get(getTemplates);
-templateRoutes.route("/:id").get(getTemplate);
+// Routes
+router.get("/", getTemplates);
+router.get("/:id", getTemplateById);
+router.post("/create-defaults", createDefaultTemplates);
 
-module.exports = templateRoutes;
+module.exports = router;

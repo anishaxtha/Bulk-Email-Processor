@@ -1,110 +1,121 @@
-const multer = require("multer");
 const ExcelJS = require("exceljs");
-const { queueEmail } = require("../services/queueService");
+const EmailTemplate = require("../models/EmailTemplate");
 const EmailLog = require("../models/EmailLog");
-
-// Set up multer for file uploads
-const storage = multer.memoryStorage();
-const upload = multer({
-  storage,
-  limits: { fileSize: 1024 * 1024 * 5 }, // 5 MB limit
-  fileFilter: (req, file, cb) => {
-    const allowedMimeTypes = [
-      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", // Excel file
-      "application/vnd.ms-excel", // Older Excel file
-      "application/pdf", // PDF file
-    ];
-
-    if (allowedMimeTypes.includes(file.mimetype)) {
-      cb(null, true);
-    } else {
-      cb(new Error("Only Excel and PDF files are allowed"), false);
-    }
-  },
-}).single("file");
+const EmailBatch = require("../models/EmailBatch");
+const { v4: uuidv4 } = require("uuid");
 
 // @desc    Process bulk emails
-// @route   POST /api/emails/bulk
+// @route   POST /api/emails/bulk-send
 // @access  Private
-exports.processBulkEmails = (req, res) => {
-  upload(req, res, async (err) => {
-    if (err) {
-      console.error("Upload error:", err);
+exports.processBulkEmails = async (req, res) => {
+  try {
+    const { templateId } = req.body;
+    const file = req.file;
+
+    // Validate inputs
+    if (!templateId) {
       return res.status(400).json({
         success: false,
-        message: err.message,
+        message: "Please select an email template",
       });
     }
 
-    try {
-      if (!req.file) {
-        return res.status(400).json({
-          success: false,
-          message: "Please upload an Excel file",
-        });
-      }
-
-      // Check for template ID
-      const { templateId } = req.body;
-      if (!templateId) {
-        return res.status(400).json({
-          success: false,
-          message: "Please select an email template",
-        });
-      }
-
-      // Parse Excel file using ExcelJS
-      const workbook = new ExcelJS.Workbook();
-      await workbook.xlsx.load(req.file.buffer);
-      const worksheet = workbook.getWorksheet(1);
-
-      if (!worksheet) {
-        return res.status(400).json({
-          success: false,
-          message: "No worksheet found in the file",
-        });
-      }
-
-      // Extract email addresses
-      const emails = [];
-      worksheet.eachRow((row, rowNumber) => {
-        if (rowNumber === 1) return; // Skip header row
-        row.eachCell((cell) => {
-          const value = cell.value?.toString().trim();
-          if (value && value.match(/^[^\s@]+@[^\s@]+\.[^\s@]+$/)) {
-            emails.push(value);
-          }
-        });
-      });
-
-      if (!emails.length) {
-        return res.status(400).json({
-          success: false,
-          message: "No valid email addresses found in the file",
-        });
-      }
-
-      // Queue emails
-      const uniqueEmails = [...new Set(emails)]; // Remove duplicates
-      const userId = req.user.id;
-
-      for (const email of uniqueEmails) {
-        await queueEmail(email, templateId, userId);
-      }
-
-      res.status(200).json({
-        success: true,
-        message: `${uniqueEmails.length} emails have been queued for processing`,
-        count: uniqueEmails.length,
-      });
-    } catch (error) {
-      console.error("Process bulk emails error:", error);
-      res.status(500).json({
+    if (!file) {
+      return res.status(400).json({
         success: false,
-        message: "Server error",
+        message: "Please upload a file with email addresses",
       });
     }
-  });
+
+    // Get the template
+    const template = await EmailTemplate.findOne({
+      _id: templateId,
+      user: req.user.id,
+    });
+
+    if (!template) {
+      return res.status(404).json({
+        success: false,
+        message: "Email template not found",
+      });
+    }
+
+    // Parse Excel file
+    const workbook = new ExcelJS.Workbook();
+    await workbook.xlsx.load(file.buffer);
+    const worksheet = workbook.getWorksheet(1);
+
+    if (!worksheet) {
+      return res.status(400).json({
+        success: false,
+        message: "No worksheet found in the file",
+      });
+    }
+
+    // Extract email addresses
+    const emails = [];
+    const validEmailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+    worksheet.eachRow((row, rowNumber) => {
+      if (rowNumber === 1) return; // Skip header row
+      row.eachCell((cell) => {
+        const value = cell.value?.toString().trim();
+        if (value && validEmailRegex.test(value)) {
+          emails.push(value);
+        }
+      });
+    });
+
+    if (emails.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "No valid email addresses found in the file",
+      });
+    }
+
+    // Remove duplicates
+    const uniqueEmails = [...new Set(emails)];
+
+    // Create batch
+    const batchId = uuidv4();
+    const batch = await EmailBatch.create({
+      batchId,
+      user: req.user.id,
+      template: template._id,
+      totalEmails: uniqueEmails.length,
+      status: "processing",
+    });
+
+    // Create email logs
+    const emailLogs = await Promise.all(
+      uniqueEmails.map((email) =>
+        EmailLog.create({
+          batchId,
+          user: req.user.id,
+          template: template._id,
+          recipient: email,
+          subject: template.subject,
+          status: "pending",
+        })
+      )
+    );
+
+    res.status(200).json({
+      success: true,
+      message: `${uniqueEmails.length} emails have been queued for processing`,
+      data: {
+        batchId: batch.batchId,
+        totalEmails: uniqueEmails.length,
+        template: template.name,
+      },
+    });
+  } catch (error) {
+    console.error("Process bulk emails error:", error);
+    res.status(500).json({
+      success: false,
+      message: error.message || "Failed to process bulk emails",
+    });
+  }
 };
 
 // @desc    Get email logs
@@ -112,66 +123,47 @@ exports.processBulkEmails = (req, res) => {
 // @access  Private
 exports.getEmailLogs = async (req, res) => {
   try {
-    // Pagination
     const page = parseInt(req.query.page, 10) || 1;
     const limit = parseInt(req.query.limit, 10) || 10;
     const startIndex = (page - 1) * limit;
 
-    // Filter by status if provided
     const filter = { user: req.user.id };
     if (req.query.status && req.query.status !== "all") {
-      // Map frontend status to backend status
-      const statusMap = {
-        success: "sent",
-        failed: "failed",
-        pending: "pending",
-        processing: "processing",
-      };
-      filter.status = statusMap[req.query.status] || req.query.status;
+      filter.status = req.query.status;
     }
 
-    // Get total count for pagination
     const total = await EmailLog.countDocuments(filter);
-
-    // Get logs with pagination
     const logs = await EmailLog.find(filter)
-      .sort({ createdAt: -1 })
+      .populate("template", "name subject")
+      .sort("-createdAt")
       .skip(startIndex)
-      .limit(limit)
-      .populate("template", "name subject");
-
-    // Calculate total pages
-    const totalPages = Math.ceil(total / limit);
+      .limit(limit);
 
     res.status(200).json({
       success: true,
-      data: logs.map((log) => ({
-        ...log.toObject(),
-        status: log.status === "sent" ? "success" : log.status, // Map backend status to frontend status
-      })),
+      data: logs,
       pagination: {
         currentPage: page,
-        totalPages: totalPages,
+        totalPages: Math.ceil(total / limit),
         totalRecords: total,
-        limit,
       },
     });
   } catch (error) {
     console.error("Get email logs error:", error);
     res.status(500).json({
       success: false,
-      message: "Server error",
+      message: "Failed to fetch email logs",
     });
   }
 };
 
-// @desc    Get email log statistics
+// @desc    Get email statistics
 // @route   GET /api/emails/stats
 // @access  Private
 exports.getEmailStats = async (req, res) => {
   try {
     const stats = await EmailLog.aggregate([
-      { $match: { user: req.user._id } }, // Changed from sentBy to user
+      { $match: { user: req.user.id } },
       {
         $group: {
           _id: "$status",
@@ -180,7 +172,6 @@ exports.getEmailStats = async (req, res) => {
       },
     ]);
 
-    // Format the statistics
     const formattedStats = {
       total: 0,
       pending: 0,
@@ -201,7 +192,7 @@ exports.getEmailStats = async (req, res) => {
     console.error("Get email stats error:", error);
     res.status(500).json({
       success: false,
-      message: "Server error",
+      message: "Failed to fetch email statistics",
     });
   }
 };

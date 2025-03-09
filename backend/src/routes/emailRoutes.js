@@ -1,4 +1,5 @@
 const express = require("express");
+const multer = require("multer");
 const {
   processBulkEmails,
   getEmailLogs,
@@ -6,12 +7,38 @@ const {
 } = require("../controllers/emailController");
 const { protect } = require("../middleware/auth");
 
-const emailRoutes = express.Router();
+const router = express.Router();
 
-emailRoutes.use(protect);
+// Multer configuration for file uploads
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB limit
+  fileFilter: (req, file, cb) => {
+    const allowedTypes = [
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", // .xlsx
+      "application/vnd.ms-excel", // .xls
+      "text/csv", // .csv
+      "application/pdf", // .pdf
+    ];
 
-emailRoutes.post("/bulk", processBulkEmails);
-emailRoutes.get("/logs", getEmailLogs);
-emailRoutes.get("/stats", getEmailStats);
+    if (allowedTypes.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(
+        new Error(
+          "Invalid file type. Only Excel, CSV, and PDF files are allowed."
+        )
+      );
+    }
+  },
+});
 
-module.exports = emailRoutes;
+// Protect all routes
+router.use(protect);
+
+// Routes
+router.post("/bulk-send", upload.single("file"), processBulkEmails);
+router.get("/logs", getEmailLogs);
+router.get("/stats", getEmailStats);
+
+module.exports = router;

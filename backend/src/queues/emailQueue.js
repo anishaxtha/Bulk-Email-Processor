@@ -1,122 +1,169 @@
-const Queue = require("bull");
+const Bull = require("bull");
+const ExcelJS = require("exceljs");
+const path = require("path");
+const fs = require("fs");
 const { v4: uuidv4 } = require("uuid");
-// const EmailLog = require("../models/emailLog.model.js");
-const { sendTemplatedEmail } = require("../services/email.service");
-const EmailTemplate = require("../models/template.model");
-const EmailLogSchema = require("../models/emailLog.model.js");
 
-// Create a new queue
-const emailQueue = new Queue("email-processing", {
+const EmailTemplate = require("../models/EmailTemplate");
+const EmailLog = require("../models/EmailLog");
+const sendEmail = require("../utils/sendEmail");
+
+// Create Bull queue
+const emailQueue = new Bull("email-processing", {
   redis: {
-    host: process.env.REDIS_HOST,
-    port: process.env.REDIS_PORT,
+    host: process.env.REDIS_HOST || "localhost",
+    port: process.env.REDIS_PORT || 6379,
   },
 });
 
-// Process queue items
+// Process emails in the queue
 emailQueue.process(async (job) => {
-  const { recipient, templateId, userId, batchId } = job.data;
+  const { filePath, templateId, userId, batchId } = job.data;
 
   try {
-    // Get template from database
+    // Get email template
     const template = await EmailTemplate.findById(templateId);
+
     if (!template) {
-      throw new Error("Template not found");
+      throw new Error("Email template not found");
     }
 
-    // Create a log entry
-    const emailLog = new EmailLogSchema({
-      recipient,
-      subject: template.subject,
-      template: templateId,
-      status: "pending",
-      userId,
-      batchId,
+    // Read Excel file
+    const workbook = new ExcelJS.Workbook();
+    await workbook.xlsx.readFile(filePath);
+
+    const worksheet = workbook.getWorksheet(1);
+
+    // Column mapping (assuming first row has headers and 'email' is one of them)
+    let emailColumnIndex = null;
+
+    // Find the email column
+    worksheet.getRow(1).eachCell((cell, colNumber) => {
+      if (cell.value && cell.value.toString().toLowerCase() === "email") {
+        emailColumnIndex = colNumber;
+      }
     });
 
-    await emailLog.save();
-
-    // Send the email
-    const result = await sendTemplatedEmail(
-      recipient,
-      template.subject,
-      template.body,
-      { recipient }
-    );
-
-    // Update the log with the result
-    if (result.success) {
-      emailLog.status = "sent";
-      emailLog.sentAt = new Date();
-    } else {
-      emailLog.status = "failed";
-      emailLog.error = result.error;
+    if (!emailColumnIndex) {
+      throw new Error("Email column not found in Excel file");
     }
 
-    await emailLog.save();
+    // Process each row (skip header)
+    let processedCount = 0;
+    const totalRows = worksheet.rowCount - 1;
 
-    // Return the result for the queue
-    return { success: result.success, logId: emailLog._id };
-  } catch (error) {
-    console.error("Error processing email:", error);
+    for (let i = 2; i <= worksheet.rowCount; i++) {
+      const row = worksheet.getRow(i);
+      const recipientEmail = row.getCell(emailColumnIndex).value;
 
-    // Log the error
-    await EmailLog.findOneAndUpdate(
-      { recipient, batchId, userId },
-      {
-        status: "failed",
-        error: error.message,
+      // Skip if email is not valid
+      if (!recipientEmail || typeof recipientEmail !== "string") {
+        continue;
       }
+
+      // Create email log entry
+      const emailLog = await EmailLog.create({
+        user: userId,
+        template: templateId,
+        recipient: recipientEmail,
+        subject: template.subject,
+        status: "pending",
+        batchId,
+      });
+
+      try {
+        // Customize email body with recipient's email
+        let customizedBody = template.body.replace("{{email}}", recipientEmail);
+
+        // Send email
+        await sendEmail({
+          email: recipientEmail,
+          subject: template.subject,
+          message: customizedBody,
+        });
+
+        // Update log with success
+        emailLog.status = "success";
+        await emailLog.save();
+      } catch (error) {
+        // Update log with failure
+        emailLog.status = "failed";
+        emailLog.error = error.message;
+        await emailLog.save();
+      }
+
+      // Update progress
+      processedCount++;
+
+      // Emit progress via Socket.io
+      const io = require("../server").io;
+      if (io) {
+        io.emit("emailProgress", {
+          batchId,
+          progress: Math.floor((processedCount / totalRows) * 100),
+          processed: processedCount,
+          total: totalRows,
+        });
+      }
+    }
+
+    // Clean up - delete the file after processing
+    fs.unlinkSync(filePath);
+
+    return { success: true, processed: processedCount };
+  } catch (error) {
+    console.error("Error processing email queue:", error);
+
+    // Update all pending logs for this batch as failed
+    await EmailLog.updateMany(
+      { batchId, status: "pending" },
+      { status: "failed", error: error.message }
     );
 
     throw error;
   }
 });
 
-// Add completed and failed event handlers for WebSocket notifications
+// Add event listeners
 emailQueue.on("completed", (job, result) => {
-  // Here we will emit socket events when implementing WebSockets
-  console.log(`Job ${job.id} completed`);
+  console.log(`Batch ${job.data.batchId} completed:`, result);
+
+  // Emit completion event via Socket.io
+  const io = require("../server").io;
+  if (io) {
+    io.emit("emailBatchCompleted", {
+      batchId: job.data.batchId,
+      result,
+    });
+  }
 });
 
 emailQueue.on("failed", (job, error) => {
-  // Here we will emit socket events when implementing WebSockets
-  console.error(`Job ${job.id} failed:`, error);
+  console.error(`Batch ${job.data.batchId} failed:`, error);
+
+  // Emit failure event via Socket.io
+  const io = require("../server").io;
+  if (io) {
+    io.emit("emailBatchFailed", {
+      batchId: job.data.batchId,
+      error: error.message,
+    });
+  }
 });
 
-// Add emails to the queue
-exports.addToEmailQueue = async (emails, templateId, userId) => {
-  const batchId = uuidv4();
+// Export function to add jobs to the queue
+module.exports = {
+  addEmailBatch: async (filePath, templateId, userId) => {
+    const batchId = uuidv4();
 
-  // Add each email to the queue
-  const jobs = emails.map((email) => {
-    return emailQueue.add({
-      recipient: email,
+    // Add job to queue
+    const job = await emailQueue.add({
+      filePath,
       templateId,
       userId,
       batchId,
     });
-  });
 
-  await Promise.all(jobs);
-
-  return { batchId, totalEmails: emails.length };
-};
-
-// Get email queue status
-exports.getQueueStatus = async () => {
-  const [waiting, active, completed, failed] = await Promise.all([
-    emailQueue.getWaitingCount(),
-    emailQueue.getActiveCount(),
-    emailQueue.getCompletedCount(),
-    emailQueue.getFailedCount(),
-  ]);
-
-  return { waiting, active, completed, failed };
-};
-
-module.exports = {
-  emailQueue,
-  addToEmailQueue,
-  getQueueStatus,
+    return { jobId: job.id, batchId };
+  },
 };
